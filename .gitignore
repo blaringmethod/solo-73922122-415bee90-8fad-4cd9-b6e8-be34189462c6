@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+.pylibs/
+run-data/
 *.sqlite3
 *.sqlite3-*
 demo/out/
+demo/out-split/

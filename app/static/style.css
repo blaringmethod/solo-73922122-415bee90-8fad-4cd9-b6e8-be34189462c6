@@ -141,6 +141,11 @@ table.grid td.num { font-variant-numeric: tabular-nums; }
 .badge.bad { background: #fbeae7; color: var(--bad); }
 .why { margin: 0.25rem 0 0; padding-left: 1.1rem; color: var(--bad); font-size: 0.78rem; }
 
+.coverage { display: flex; flex-wrap: wrap; align-items: center; gap: 0.2rem; margin-bottom: 0.2rem; }
+.coverage .arrow { color: var(--muted); font-size: 0.78rem; }
+.chip.origin { background: #f4f2ec; color: var(--ink); border-style: solid; }
+.chip.leaf { background: var(--accent-soft); color: var(--accent); }
+
 .result { border-left: 5px solid var(--accent); }
 .result.conflict, .result.none { border-left-color: var(--warn); }
 .big-number {

@@ -2,10 +2,18 @@
 
 Rules implemented here, in one place so the web layer cannot drift:
 
-* Only sheets whose *every* recorded batch revision equals that batch's
-  current revision in the same snapshot may be used.
-* A combination of sheets is valid for the checked batches when every
-  checked batch is counted exactly once and no unchecked batch appears.
+* Sheets keep the batch codes and revisions they were issued against. After a
+  batch split, an original batch code is expanded along ``snapshot.lineage``
+  into its current leaf descendants, so an old sheet's coverage automatically
+  follows every descendant of the batches it names.
+* A sheet is usable only when, for every recorded batch, *all* of its current
+  leaf descendants carry the revision recorded on the sheet. If one child has
+  been revised separately, the whole sheet goes stale.
+* A combination of sheets is valid for the checked batches when every checked
+  batch is counted exactly once and no unchecked batch appears. Because a
+  split expands one sheet entry into several leaves, selecting only one child
+  can never be covered by a sheet that was written for the parent: the whole
+  sheet total can never be reported for just one child.
 * If every valid combination has the same page total, that total is reported.
 * If valid combinations disagree, two witness combinations with different
   totals are returned.
@@ -33,6 +41,21 @@ class StaleSheet:
 
 
 @dataclass(frozen=True)
+class SheetView:
+    """A sheet after lineage expansion for display and reconciliation."""
+
+    sheet: Sheet
+    # Original batch code -> sorted current leaf codes it now covers.
+    coverage: dict[str, tuple[str, ...]]
+    # Human-readable reasons the sheet cannot be used; empty means usable.
+    stale_details: tuple[str, ...]
+
+    @property
+    def is_stale(self) -> bool:
+        return bool(self.stale_details)
+
+
+@dataclass(frozen=True)
 class CoverResult:
     status: str  # "ok" | "conflict" | "none"
     total: int | None
@@ -42,20 +65,84 @@ class CoverResult:
     stale_sheets: tuple[StaleSheet, ...]
 
 
-def _stale_details(sheet: Sheet, current: dict[str, Batch]) -> tuple[str, ...]:
-    details = []
-    for code, revision in sheet.entries:
-        batch = current.get(code)
-        if batch is None:
-            details.append(f"{code} 不在现行批次清单")
-        elif batch.revision != revision:
-            details.append(f"{code} 单上修订 r{revision} ≠ 现行 r{batch.revision}")
-    return tuple(details)
+def _children_map(snapshot: Snapshot) -> dict[str, tuple[str, ...]]:
+    children: dict[str, list[str]] = {}
+    for parent, child in snapshot.lineage:
+        children.setdefault(parent, []).append(child)
+    return {parent: tuple(sorted(kids)) for parent, kids in children.items()}
+
+
+def leaf_descendants(
+    code: str, children: dict[str, tuple[str, ...]]
+) -> tuple[str, ...]:
+    """Current leaf batches under ``code`` (itself when it was never split)."""
+    if code not in children:
+        return (code,)
+    leaves: list[str] = []
+    stack = list(children[code])
+    while stack:
+        node = stack.pop()
+        kids = children.get(node)
+        if kids:
+            stack.extend(kids)
+        else:
+            leaves.append(node)
+    return tuple(sorted(leaves))
+
+
+def expanded_sheet_views(snapshot: Snapshot) -> tuple[SheetView, ...]:
+    """Expand every sheet's original batches along the lineage.
+
+    Missing current batches are reported as stale rather than raised: an
+    import replaces the whole state, and sheets from the new snapshot always
+    name batches of that snapshot, so this is the defensive branch.
+    """
+    children = _children_map(snapshot)
+    current = snapshot.batch_by_code
+    views: list[SheetView] = []
+    for sheet in snapshot.sheets:
+        coverage: dict[str, tuple[str, ...]] = {}
+        details: list[str] = []
+        for original, recorded_revision in sheet.entries:
+            leaves = leaf_descendants(original, children)
+            coverage[original] = leaves
+            if not leaves or all(leaf not in current for leaf in leaves):
+                details.append(f"{original} 不在现行批次清单")
+                continue
+            mismatched = sorted(
+                leaf
+                for leaf in leaves
+                if leaf in current
+                and current[leaf].revision != recorded_revision
+            )
+            if mismatched:
+                shown = "、".join(mismatched)
+                if tuple(mismatched) == leaves and len(leaves) == 1 and leaves[0] == original:
+                    details.append(
+                        f"{original} 单上修订 r{recorded_revision} ≠ "
+                        f"现行 r{current[original].revision}"
+                    )
+                else:
+                    details.append(
+                        f"{original} 现覆盖 {'、'.join(leaves)}，其中 {shown} 的现行"
+                        f"修订与单上 r{recorded_revision} 不一致"
+                    )
+        views.append(SheetView(sheet, coverage, tuple(details)))
+    return tuple(views)
+
+
+def stale_sheets_for(snapshot: Snapshot) -> tuple[StaleSheet, ...]:
+    """Sheets whose expanded revisions do not all match the snapshot."""
+    return tuple(
+        StaleSheet(view.sheet.code, view.stale_details)
+        for view in expanded_sheet_views(snapshot)
+        if view.is_stale
+    )
 
 
 def _exact_covers(
     selected: tuple[str, ...],
-    sheets: Iterable[Sheet],
+    candidates: list[tuple[int, Sheet]],
 ) -> tuple[int, list[Witness]]:
     """Enumerate exact covers restricted to the selected batch set.
 
@@ -67,27 +154,6 @@ def _exact_covers(
     """
     index = {code: i for i, code in enumerate(selected)}
     selected_mask = (1 << len(selected)) - 1
-
-    candidates: list[tuple[int, Sheet]] = []
-    for sheet in sorted(sheets, key=lambda s: s.code):
-        if not sheet.entries:
-            continue
-        mask = 0
-        fits = True
-        for code, _revision in sheet.entries:
-            bit = index.get(code)
-            if bit is None:  # extra batch outside the checked set
-                fits = False
-                break
-            if mask & (1 << bit):  # duplicate entry, invalid sheet
-                fits = False
-                break
-            mask |= 1 << bit
-        if fits and mask:
-            candidates.append((mask, sheet))
-
-    if not candidates:
-        return 0, []
 
     by_lowest: list[list[tuple[int, Sheet]]] = [[] for _ in range(len(selected))]
     for mask, sheet in candidates:
@@ -140,17 +206,6 @@ def _exact_covers(
     ]
 
 
-def stale_sheets_for(snapshot: Snapshot) -> tuple[StaleSheet, ...]:
-    """Sheets whose recorded revisions do not all match the snapshot."""
-    current = snapshot.batch_by_code
-    stale = []
-    for sheet in snapshot.sheets:
-        details = _stale_details(sheet, current)
-        if details:
-            stale.append(StaleSheet(sheet.code, details))
-    return tuple(stale)
-
-
 def reconcile(snapshot: Snapshot, selected_codes: Iterable[str]) -> CoverResult:
     current = snapshot.batch_by_code
     selected_seen: list[str] = []
@@ -159,28 +214,53 @@ def reconcile(snapshot: Snapshot, selected_codes: Iterable[str]) -> CoverResult:
             selected_seen.append(code)
     selected = tuple(sorted(selected_seen, key=lambda c: (c.casefold(), c)))
 
-    usable: list[Sheet] = []
-    stale = stale_sheets_for(snapshot)
-    stale_codes = {s.code for s in stale}
-    for sheet in snapshot.sheets:
-        if sheet.code not in stale_codes:
-            usable.append(sheet)
-
     requested = tuple(sorted(set(selected_codes)))
     ignored = tuple(sorted(code for code in requested if code not in current))
 
-    usable_codes = tuple(s.code for s in usable)
-    if not selected or ignored:
-        return CoverResult("none", None, (), 0, usable_codes, tuple(stale))
+    views = expanded_sheet_views(snapshot)
+    stale = tuple(
+        StaleSheet(view.sheet.code, view.stale_details)
+        for view in views
+        if view.is_stale
+    )
+    stale_codes = {item.code for item in stale}
+    usable_views = [view for view in views if not view.is_stale]
+    usable_codes = tuple(view.sheet.code for view in usable_views)
 
-    count, witnesses = _exact_covers(selected, usable)
+    if not selected or ignored:
+        return CoverResult("none", None, (), 0, usable_codes, stale)
+
+    # A usable sheet is represented by the leaf set it now covers. Any leaf
+    # outside the checked set (including a sibling child left unselected)
+    # disqualifies the whole sheet, which is what forbids reporting a whole
+    # sheet total for a single child batch.
+    index = {code: i for i, code in enumerate(selected)}
+    candidates: list[tuple[int, Sheet]] = []
+    for view in usable_views:
+        mask = 0
+        fits = True
+        seen: set[int] = set()
+        for leaves in view.coverage.values():
+            for leaf in leaves:
+                bit = index.get(leaf)
+                if bit is None or bit in seen:  # extra/duplicate leaf
+                    fits = False
+                    break
+                seen.add(bit)
+                mask |= 1 << bit
+            if not fits:
+                break
+        if fits and mask:
+            candidates.append((mask, view.sheet))
+
+    count, witnesses = _exact_covers(selected, candidates)
     if count == 0 or not witnesses:
-        return CoverResult("none", None, (), count, usable_codes, tuple(stale))
+        return CoverResult("none", None, (), count, usable_codes, stale)
     if len(witnesses) == 1:
         return CoverResult(
             "ok", witnesses[0].total, tuple(witnesses), count,
-            usable_codes, tuple(stale),
+            usable_codes, stale,
         )
     return CoverResult(
-        "conflict", None, tuple(witnesses), count, usable_codes, tuple(stale)
+        "conflict", None, tuple(witnesses), count, usable_codes, stale
     )

@@ -31,9 +31,21 @@ CREATE TABLE IF NOT EXISTS sheet_entries (
     revision      INTEGER NOT NULL CHECK (revision > 0),
     PRIMARY KEY (submission_id, sheet_code, batch_code),
     FOREIGN KEY (submission_id, sheet_code)
-        REFERENCES sheets(submission_id, code) ON DELETE CASCADE,
-    FOREIGN KEY (submission_id, batch_code)
-        REFERENCES batches(submission_id, code) ON DELETE CASCADE
+        REFERENCES sheets(submission_id, code) ON DELETE CASCADE
+    -- No FK on batch_code: after a split a sheet entry may keep naming the
+    -- original batch, which survives only as a batch_lineage parent node.
+);
+
+-- Parent/child batch links inside one snapshot. A split clones the snapshot,
+-- replaces one leaf batch with two children and extends this table. Summary
+-- sheets keep the *original* batch codes and revisions; reconciliation walks
+-- this table to expand an original batch into its current leaf descendants.
+-- An empty table (legacy snapshots) means every batch is its own leaf root.
+CREATE TABLE IF NOT EXISTS batch_lineage (
+    submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+    parent_code   TEXT NOT NULL,
+    child_code    TEXT NOT NULL,
+    PRIMARY KEY (submission_id, parent_code, child_code)
 );
 
 CREATE INDEX IF NOT EXISTS idx_batches_submission
@@ -42,6 +54,8 @@ CREATE INDEX IF NOT EXISTS idx_sheets_submission
     ON sheets(submission_id);
 CREATE INDEX IF NOT EXISTS idx_entries_submission
     ON sheet_entries(submission_id);
+CREATE INDEX IF NOT EXISTS idx_lineage_submission
+    ON batch_lineage(submission_id);
 
 -- Hard limits from the acceptance rules, enforced even if code is bypassed.
 CREATE TRIGGER IF NOT EXISTS trg_batches_limit

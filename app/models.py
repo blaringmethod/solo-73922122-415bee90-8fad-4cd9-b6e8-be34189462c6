@@ -37,6 +37,9 @@ class Snapshot:
     submission: Submission
     batches: tuple[Batch, ...]
     sheets: tuple[Sheet, ...]
+    # (parent_code, child_code) links inside this snapshot. Absent rows mean
+    # the snapshot predates splitting and every batch is its own lineage root.
+    lineage: tuple[tuple[str, str], ...] = ()
 
     @property
     def batch_by_code(self) -> dict[str, Batch]:

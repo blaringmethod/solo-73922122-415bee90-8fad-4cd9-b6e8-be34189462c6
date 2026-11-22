@@ -14,7 +14,7 @@ from flask import (
 from . import repository
 from .db import get_db
 from .parsing import MAX_BATCHES, MAX_SHEETS, ImportError_, parse_and_check
-from .reconcile import reconcile, stale_sheets_for
+from .reconcile import expanded_sheet_views, reconcile, stale_sheets_for
 
 bp = Blueprint("main", __name__)
 
@@ -79,6 +79,8 @@ def index():
         result=result,
         error=error,
         stale=stale_sheets_for(snapshot) if snapshot else (),
+        sheet_views=expanded_sheet_views(snapshot) if snapshot else (),
+        max_batches=MAX_BATCHES,
     )
 
 
@@ -141,4 +143,29 @@ def update_revision():
         flash(exc.message, "error")
         return redirect(url_for("main.index"))
     flash(f"已提交更版 #{new_id}：{code} 现行修订号改为 r{revision}。", "ok")
+    return redirect(url_for("main.index"))
+
+
+@bp.post("/split")
+def split_batch():
+    conn = get_db()
+    code = request.form.get("code", "").strip()
+    child_a = request.form.get("child_a", "").strip()
+    child_b = request.form.get("child_b", "").strip()
+    raw_base = request.form.get("base_id", "").strip()
+    try:
+        base_id = int(raw_base)
+    except ValueError:
+        flash("页面状态已过期，请刷新后重试", "error")
+        return redirect(url_for("main.index"))
+    try:
+        new_id = repository.split_batch(conn, base_id, code, child_a, child_b)
+    except repository.RevisionError as exc:
+        flash(exc.message, "error")
+        return redirect(url_for("main.index"))
+    flash(
+        f"已提交拆批 #{new_id}：{code} 拆为 {child_a}、{child_b}，"
+        "两个子批沿用原修订号，旧汇总单仍然有效。",
+        "ok",
+    )
     return redirect(url_for("main.index"))

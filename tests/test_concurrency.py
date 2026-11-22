@@ -13,6 +13,7 @@ from app.repository import (
     import_documents,
     latest_submission,
     list_submissions,
+    split_batch,
     update_revision,
 )
 
@@ -74,3 +75,47 @@ def test_revision_rejects_base_that_is_not_latest(tmp_path):
         update_revision(conn, base, "B01", 3)
     assert latest_submission(conn).id == new
     conn.close()
+
+
+def test_concurrent_splits_only_one_wins(tmp_path):
+    path = str(tmp_path / "split-race.sqlite3")
+    setup = connect(path)
+    init_db(setup)
+    base = import_documents(
+        setup,
+        (Batch("B01", 1), Batch("B02", 1)),
+        (Sheet("S1", 10, (("B01", 1), ("B02", 1))),),
+    )
+    setup.close()
+
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+
+    def worker(code: str, suffix: str) -> None:
+        conn = connect(path)
+        try:
+            barrier.wait(timeout=5)
+            split_batch(conn, base, code, f"{code}A{suffix}", f"{code}B{suffix}")
+            results.append("ok")
+        except RevisionError:
+            results.append("rejected")
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(target=worker, args=("B01", "1")),
+        threading.Thread(target=worker, args=("B02", "2")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert sorted(results) == ["ok", "rejected"]
+    conn = connect(path)
+    try:
+        # base + exactly one split commit; no interleaved/partial state.
+        assert len(list_submissions(conn)) == 2
+        assert latest_submission(conn).id == base + 1
+    finally:
+        conn.close()
